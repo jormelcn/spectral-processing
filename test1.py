@@ -3,7 +3,7 @@ import matplotlib.image as image
 import matplotlib.pyplot as plt
 
 ImgSpectral.cache = True
-ImgSpectral.verbose = False
+ImgSpectral.verbose = True
 
 # Guardar una imagen PNG
 def saveImagePng(img, filePath, cmap=None):
@@ -16,7 +16,7 @@ imgL8_L2 = ImgSpectral("./imagery/LC080070582014011001T1-SC20190912191355.landsa
 imgS2 = ImgSpectral("./imagery/S2A_OPER_MSI_L1C_TL_EPA__20151208T152341_20170529T085215_A002410_T18NYJ_N02_04_01.sentinel2")
 imgH = ImgSpectral("./imagery/EO1H0070582015062110KF.hyperion")
 
-rf = 1
+# rf = 1
 # saveImagePng(imgL7_L1.resize(rf).rgb(), "imgL7_L1.png")
 # saveImagePng(imgL7_L2.resize(rf).rgb(), "imgL7_L2.png")
 # saveImagePng(imgL8_L1.resize(rf).rgb(), "imgL8_L1.png")
