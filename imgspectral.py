@@ -5,37 +5,36 @@ from osgeo import ogr
 from osgeo import osr
 from collections.abc import Sequence
 
-class ImgBand(np.ndarray):
+    
+class ImgBandsGroup(np.ndarray):
 
-    def __make__(self, dataset, resizeFactor, subset, subsetMode, verbose):
-        self.verbose = verbose
-        self.dataset = dataset
-        self.resizeFactor = int(resizeFactor)
+    def __make__(self, datasets, bands, subset, subsetMode, resizeFactor, geodata, verbose):
+        self.datasets = datasets
+        self.bands = bands
         self.subset = subset
         self.subsetMode = subsetMode
-        self.__generateCoordinateSystem__()
+        self.resizeFactor = int(resizeFactor)
+        self.geoTransform = geodata[0]
+        self.transToLatLon = geodata[1]
+        self.transToXY = geodata[2]
+        self.verbose = verbose
         self.__calculateShapes__()
-        self.__verifyShapes__()
-    
+
     @staticmethod
-    def make(dataset, resizeFactor, subset=None, subsetMode = 'latlon', verbose=False, cache=None):
+    def make(datasets, bands, subset, subsetMode, resizeFactor, geodata, verbose=False, cache = None):
         if cache is None:
-            imgBand = ImgBand(0)
-            imgBand.__make__(dataset, resizeFactor, subset, subsetMode, verbose)    
-            imgBand.resize(imgBand.factorShape, refcheck=False)
-            imgBand.__load__()
+            imgBandsGroup = ImgBandsGroup(0)
+            imgBandsGroup.__make__(datasets, bands, subset, subsetMode, resizeFactor, geodata, verbose)
+            imgBandsGroup.resize(imgBandsGroup.factorShape + (len(bands),), refcheck=False)
+            imgBandsGroup.__load__()
         else:
-            imgBand = ImgBand(cache.shape, dtype=cache.dtype, buffer=cache, offset=0)
-            imgBand.__make__(dataset, resizeFactor, subset, subsetMode, verbose)
-        return imgBand
-    
-    def __generateCoordinateSystem__(self):
-        self.geoTransform = self.dataset.GetGeoTransform()
-        source = osr.SpatialReference()
-        source.ImportFromWkt(self.dataset.GetProjection())
-        target = source.CloneGeogCS()
-        self.transToLatLon = osr.CoordinateTransformation(source, target)
-        self.transToXY = osr.CoordinateTransformation(target, source)    
+            imgBandsGroup = ImgBandsGroup(cache.shape, dtype=cache.dtype, buffer=cache, offset=0)
+            imgBandsGroup.__make__(datasets, bands, subset, subsetMode, resizeFactor, geodata, verbose)
+        return imgBandsGroup
+
+    def __print__(self, str, end='\n'):
+        if self.verbose:
+            print(str, end=end)
 
     def __xy2pixel__(self, xy):
         gt = self.geoTransform
@@ -48,7 +47,7 @@ class ImgBand(np.ndarray):
         return   int(l/abs(self.geoTransform[5]))
 
     def __calculateShapes__(self):
-        rasterShape = np.array((self.dataset.RasterYSize, self.dataset.RasterXSize))
+        rasterShape = np.array((self.datasets[0].RasterYSize, self.datasets[0].RasterXSize))
         self.rasterShape = tuple(rasterShape)
         if self.subset is None:
             factorShape = np.floor(rasterShape/self.resizeFactor).astype(int)
@@ -65,12 +64,8 @@ class ImgBand(np.ndarray):
                 ss_heigth += 1
             self.factorShape = (int(ss_heigth/self.resizeFactor), int(ss_width/self.resizeFactor))
             self.realSubset = (ss_center[0]-(ss_heigth-1)/2, ss_center[1]-(ss_width-1)/2) + (ss_width, ss_heigth)
-            self.__print__("Real subset: {}".format(str(self.realSubset)))
         else :
             raise ValueError("Invalid subset Mode")
-
-    def __verifyShapes__(self):
-        pass
 
     def __areaMean__(self, a):
         f = self.resizeFactor
@@ -78,84 +73,70 @@ class ImgBand(np.ndarray):
         a1 = a.reshape((a0.shape[0], f, int(a0.shape[1]*a0.shape[2]/f)), order='F')
         a2 = np.transpose(a1,axes=[1,0,2]).reshape((int(f**2),int(a0.size/(f**2))), order='F')
         a3 = a2.mean(axis=0).reshape((int(a0.shape[0]/f), int(a0.shape[1]/f), a0.shape[2]), order='F')
-        return a3.reshape(a3.shape[0:len(a.shape)])
-
-    def __refactor__(self, raw, row):
-        self[row : row + int(raw.shape[0]/self.resizeFactor),:] = self.__areaMean__(raw)
-
-    def __print__(self, str, end='\n'):
-        if self.verbose:
-            print(str, end=end)
-
-    def __load__(self):
-        max_load_memory = 1250000
-        load_block_rows = int(max_load_memory/self.realSubset[2])
-        load_block_rows -= load_block_rows%self.resizeFactor
-        load_block = [min(int(load_block_rows), self.realSubset[3]), self.realSubset[2]]
-        row = int(0)
-        while row < self.factorShape[0]:
-            raw = self.dataset.ReadAsArray( int(self.realSubset[0]), 
-                                            int(self.realSubset[1] + row*self.resizeFactor), 
-                                            int(load_block[1]), int(load_block[0]))
-            self.__refactor__(raw, row)
-            row += int(load_block[0]/self.resizeFactor)    
-            if row*self.resizeFactor + load_block[0] > self.rasterShape[0]:
-                load_block[0] = (self.factorShape[0] - row)*self.resizeFactor
-            loaded = (row/self.factorShape[0])
-            self.__print__('  loaded {:.0f} %'.format(loaded*100.0), end = '\r')
-        self.__print__("                                          ", end='\r')
-        
-
-class ImgBandsGroup(ImgBand):
-
-    @staticmethod
-    def make(datasets, resizeFactor, subset=None, subsetMode='latlon', verbose=False, cache = None):
-        ImgBandsGroup.__verifyDatasets__(datasets)
-        if cache is None:
-            imgBandsGroup = ImgBandsGroup(0)
-            imgBandsGroup.datasets = datasets
-            imgBandsGroup.__make__(datasets[0], resizeFactor, subset, subsetMode, verbose)
-            imgBandsGroup.resize(imgBandsGroup.factorShape + (len(datasets),), refcheck=False)
-            imgBandsGroup.__load__()
-        else:
-            imgBandsGroup = ImgBandsGroup(cache.shape, dtype=cache.dtype, buffer=cache, offset=0)
-            imgBandsGroup.datasets = datasets
-            imgBandsGroup.__make__(datasets[0], resizeFactor, subset, subsetMode, verbose)
-        return imgBandsGroup
-
-    @staticmethod
-    def __verifyDatasets__(datasets):
-        pass
+        return a3.reshape(a3.shape[0:len(a.shape)], order='F')
 
     def __refactor__(self, raw, row, band):
         self[row : row + int(raw.shape[0]/self.resizeFactor),:,band] = self.__areaMean__(raw)
 
+    def __loadBlock__(self, block, row):
+        for i in range(len(self.bands)):
+            band = self.bands[i]
+            ds = self.datasets[0] if len(self.datasets)==1 else self.datasets[band]
+            raw = ds.ReadAsArray(   int(self.realSubset[0]), 
+                                    int(self.realSubset[1] + row*self.resizeFactor), 
+                                    int(block[1]), int(block[0]))
+            if len(raw.shape) == 2:
+                self.__refactor__(raw, row, i)
+            elif len(raw.shape) == 3 and raw.shape[0] >= max(self.bands) + 1:
+                for j in range(len(self.bands)):
+                    self.__refactor__(raw[self.bands[j],:,:], row, j)
+                return
+            else:
+                raise ValueError("Dataset Bands Number Not satisfy bands selection")
+
     def __load__(self):
         max_load_memory = 1250000
-        load_block_rows = int(max_load_memory/self.realSubset[2])
-        load_block_rows -= load_block_rows%self.resizeFactor
-        for band in range(len(self.datasets)):
-            dataset = self.datasets[band]
-            load_block = [min(int(load_block_rows), self.realSubset[3]), self.realSubset[2]]
-            row = int(0)
-            while row < self.factorShape[0]:
-                raw = dataset.ReadAsArray(  int(self.realSubset[0]), 
-                                            int(self.realSubset[1] + row*self.resizeFactor), 
-                                            int(load_block[1]), int(load_block[0]))
-                self.__refactor__(raw, row, band)
-                row += int(load_block[0]/self.resizeFactor)    
-                if row*self.resizeFactor + load_block[0] > self.rasterShape[0]:
-                    load_block[0] = (self.factorShape[0] - row)*self.resizeFactor
-                loaded = (band + row/self.factorShape[0])/len(self.datasets)
-                self.__print__('  loaded {:.0f} %'.format(loaded*100.0), end = '\r')
+        block_rows = int(max_load_memory/self.realSubset[2])
+        block_rows -= block_rows%self.resizeFactor
+        block = [min(int(block_rows), self.realSubset[3]), self.realSubset[2]]
+        row = int(0)
+        while row < self.factorShape[0]:
+            self.__loadBlock__(block, row)
+            row += int(block[0]/self.resizeFactor)    
+            if row*self.resizeFactor + block[0] > self.rasterShape[0]:
+                block[0] = (self.factorShape[0] - row)*self.resizeFactor
+            loaded = row/self.factorShape[0]
+            self.__print__('  loaded {:.0f} %'.format(loaded*100.0), end = '\r')
         self.__print__("                                              ", end='\r')
             
 
+class ImgBand(ImgBandsGroup):
+
+    @staticmethod
+    def make(dataset, bands, subset, subsetMode, resizeFactor, geodata, verbose=False, cache=None):
+        if cache is None:
+            imgBand = ImgBand(0)
+            imgBand.__make__([dataset], bands, subset, subsetMode, resizeFactor, geodata, verbose)
+            imgBand.resize(imgBand.factorShape, refcheck=False)
+            imgBand.__load__()
+        else:
+            imgBand = ImgBand(cache.shape, dtype=cache.dtype, buffer=cache, offset=0)
+            imgBand.__make__([dataset], bands, subset, subsetMode, resizeFactor, geodata, verbose)
+        return imgBand 
+
+    def __refactor__(self, raw, row, band):
+        self[row : row + int(raw.shape[0]/self.resizeFactor),:] = self.__areaMean__(raw)
+    
 
 class ImgSpectral:
 #********************************* Default Config ************************************
-    validExtensions = ['sentinel2', 'landsat8', 'landsat7', 'hyperion']
-    extensionsConfig = {
+    validSensors = ['sentinel2', 'landsat8', 'landsat7', 'hyperion']
+    sensorsConfig = {
+        'default' : {
+            'bandsExtensions' : ['tif', 'TIF', 'jp2', 'JP2'],
+            'nameSeparator' : '_',
+            'bandsPrefixes' : ['band', 'band0', 'band00', 'BAND', 'BAND0', 'BAND00','b', 'b0', 'b00', 'B', 'B0', 'B00']
+        },
         'hyperion' : {
             'bandsExtensions' : ['tif', 'TIF'],
             'nameSeparator' : '_',
@@ -198,32 +179,30 @@ class ImgSpectral:
 
 #********************************* Constructor **************************************
 
-    def __init__(self, path, resizeFactor = None, cache = None, subset= None, subsetMode='latlon') :
-        path_split = path.split('.')
-        self.path = path
+    def __init__(self, path, sensor = 'default', resizeFactor = None, cache = None, subset= None, subsetMode='latlon'):
+        self.sensor = sensor
         self.resizeFactor = resizeFactor if not resizeFactor is None else ImgSpectral.resizeFactor
         self.cache = cache if not (cache is None) else ImgSpectral.cache
-        self.extension = path_split[-1]
-        if not(self.extension in ImgSpectral.validExtensions) :
-            raise ValueError('Invalid Path Extension')
-        self.pathFolder = Path('.'.join(path_split[0:-1]))
-        if not self.pathFolder.exists() :
-            raise FileNotFoundError('Data Folder Not Exist') 
-        self.config = ImgSpectral.extensionsConfig[self.extension]
+        if not(self.sensor in ImgSpectral.validSensors) :
+            raise ValueError('Invalid Sensor')
+        self.pathString = path
+        self.path = Path(path) 
+        if not self.path.exists() :
+            raise FileNotFoundError('Data Path Not Exist') 
+        self.config = ImgSpectral.sensorsConfig[self.sensor]
         self.__subset = subset
         self.__subsetMode = subsetMode
         self.__selectBandsFiles__()
-        cacheFolderName = str(self.resizeFactor)
-        self.pathCahe = self.pathFolder/'.imgspectral/cache'/cacheFolderName
+        self.pathCahe = self.path/'.imgspectral/cache'/str(self.resizeFactor)
         self.__bandsGroups__ = {}
         self.datasets = {}
 
 #**********************************  User Methods ***********************************
     def resize(self, resizeFactor):
-        return ImgSpectral(self.path, resizeFactor, self.cache, self.__subset, self.__subsetMode)
+        return ImgSpectral(self.pathString, self.sensor, resizeFactor, self.cache, self.__subset, self.__subsetMode)
 
     def subset(self, subset, subsetMode='latlon'):
-        return ImgSpectral(self.path, self.resizeFactor, self.cache, subset, subsetMode)
+        return ImgSpectral(self.pathString, self.sensor, self.resizeFactor, self.cache, subset, subsetMode)
 
     def bandsGroup(self, bands):
         if len(bands) < 1:
@@ -281,6 +260,15 @@ class ImgSpectral:
         elif len(rgb) == 3:
             return ImgSpectral.color(np.dstack((rgb[0], rgb[1], rgb[2])))
 
+    @staticmethod
+    def geodata(ds):
+        geoTransform = ds.GetGeoTransform()
+        source = osr.SpatialReference()
+        source.ImportFromWkt(ds.GetProjection())
+        target = source.CloneGeogCS()
+        transToLatLon = osr.CoordinateTransformation(source, target)
+        transToXY = osr.CoordinateTransformation(target, source)   
+        return (geoTransform, transToLatLon, transToXY)
 
 #******************************** Intern Methods ************************************
 
@@ -294,8 +282,9 @@ class ImgSpectral:
         if self.cache :
             band = self.__loadBandFromCache__(cachePathFile, dataset)
         if band is None:
-            self.__print__('Loading %s %s image from Dataset...' % (self.pathFolder.name, cachePathFile))
-            band = ImgBand.make(dataset, self.resizeFactor, self.__subset, self.__subsetMode, self.verbose)
+            self.__print__('Loading %s %s image from Dataset...' % (self.path.name, cachePathFile))
+            geodata = ImgSpectral.geodata(dataset)
+            band = ImgBand.make(dataset, [0], self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, None)
             if self.cache :
                 self.__saveCache__(cachePathFile, band)
         return band
@@ -305,8 +294,9 @@ class ImgSpectral:
         if self.cache :
             bandsGroup = self.__loadGroupFromCache__(cachePathFile, datasetGroup)
         if bandsGroup is None:
-            self.__print__('Loading %s %s image from Dataset...' % (self.pathFolder.name, cachePathFile))
-            bandsGroup = ImgBandsGroup.make(datasetGroup, self.resizeFactor, self.__subset, self.__subsetMode, self.verbose)
+            self.__print__('Loading %s %s image from Dataset...' % (self.path.name, cachePathFile))
+            geodata = ImgSpectral.geodata(datasetGroup[0])
+            bandsGroup = ImgBandsGroup.make(datasetGroup, range(len(datasetGroup)), self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, None)
             if self.cache :
                 self.__saveCache__(cachePathFile, bandsGroup)
         return bandsGroup
@@ -332,15 +322,15 @@ class ImgSpectral:
             if not band in self.datasets:
                 bandPath = self.__findBandPathFile__(band)
                 if bandPath is None:
-                    raise ValueError('Error: %s band %s not Found...' % (self.pathFolder.name, band)) 
-                self.datasets[band] = gd.Open(str(self.pathFolder/bandPath))
+                    raise ValueError('Error: %s band %s not Found...' % (self.path.name, band)) 
+                self.datasets[band] = gd.Open(str(self.path/bandPath))
             datasets.append(self.datasets[band]) 
         return datasets
 
     def __selectBandsFiles__(self):
         self.bandsFiles = []
         for ext in self.config['bandsExtensions']:
-            paths = list(self.pathFolder.glob('**/*.' + ext))
+            paths = list(self.path.glob('**/*.' + ext))
             for path in paths:
                 self.bandsFiles.append(path.name.split('.'))    
         
@@ -355,16 +345,20 @@ class ImgSpectral:
     def __loadBandFromCache__(self, filePath, dataset) :
         if not (self.pathCahe/(filePath + '.npy')).exists() :
             return None
-        self.__print__('Loading %s %s data from Cache' % (self.pathFolder.name, filePath))
+        self.__print__('Loading %s %s data from Cache' % (self.path.name, filePath))
         cache = np.load(self.pathCahe/(filePath + '.npy'))
-        return ImgBand.make(dataset, self.resizeFactor, self.__subset, self.__subsetMode, self.verbose, cache)
+        geodata = ImgSpectral.geodata(dataset)
+        band = ImgBand.make(dataset, [0], self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, cache)
+        return band
 
     def __loadGroupFromCache__(self, filePath, datasets) :
         if not (self.pathCahe/(filePath + '.npy')).exists() :
             return None
-        self.__print__('Loading %s %s data from Cache' % (self.pathFolder.name, filePath))
+        self.__print__('Loading %s %s data from Cache' % (self.path.name, filePath))
         cache = np.load(self.pathCahe/(filePath + '.npy'))
-        return ImgBandsGroup.make(datasets, self.resizeFactor, self.__subset, self.__subsetMode, self.verbose, cache)
+        geodata = ImgSpectral.geodata(datasets[0])
+        bandsGroup = ImgBandsGroup.make(datasets, range(len(datasets)), self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, cache)
+        return bandsGroup
         
     def __saveCache__(self, filePath, data) :
         if not self.pathCahe.exists() : 
