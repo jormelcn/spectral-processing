@@ -30,5 +30,5 @@ print(nir)
 #plt.imshow(ndvi, cmap='inferno')
 
 plt.figure()
-plt.imshow(imgH_ss1.ndvi(), cmap='inferno')
+plt.imshow(imgH_ss1.ndvi(), cmap='Greens')
 plt.show()

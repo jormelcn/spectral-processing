@@ -1,11 +1,38 @@
+import os
 import numpy as np
 import gdal as gd
 from pathlib import Path
-from osgeo import ogr
-from osgeo import osr
-from collections.abc import Sequence
+from osgeo import ogr, osr
+from scipy.ndimage import uniform_filter, median_filter, gaussian_filter, convolve
 
-    
+def cut(band, shape):
+    return band[0:shape[0],0:shape[1]]
+
+def resample(band, factor):
+    x, y = band.shape
+    n = factor
+    bands = [band for i in range(factor**2)]
+    a4 = np.dstack(bands)
+    return np.transpose( a4.reshape((x*y*n, n)).reshape((x,n*y,n)), axes=[1,2,0] ).reshape((n*y, n*x), order='F').T
+
+def color(reflectance):
+    return ImgSpectral.color(reflectance)
+
+def composite(*rgb):
+    return ImgSpectral.composite(*rgb)
+
+def geodata(path):
+    if os.path.isdir(path):
+        ds = gd.Open(ImgSpectral(path).bandsFiles[0])
+    elif os.path.isfile(path):
+        ds = gd.Open(path)
+    else:
+        raise ValueError("Path not exist")
+    return ImgSpectral.geodata(ds)
+
+def open(path, sensor='default', geodata = None, resizeFactor=1):
+    return ImgSpectral(path, sensor, resizeFactor, geodata=geodata)
+
 class ImgBandsGroup(np.ndarray):
 
     def __make__(self, datasets, bands, subset, subsetMode, resizeFactor, geodata, verbose):
@@ -18,6 +45,7 @@ class ImgBandsGroup(np.ndarray):
         self.transToLatLon = geodata[1]
         self.transToXY = geodata[2]
         self.verbose = verbose
+        self.__verifyDatasets__()
         self.__calculateShapes__()
 
     @staticmethod
@@ -32,6 +60,38 @@ class ImgBandsGroup(np.ndarray):
             imgBandsGroup.__make__(datasets, bands, subset, subsetMode, resizeFactor, geodata, verbose)
         return imgBandsGroup
 
+    def filter(self, kernel, apply = True, origin=0):
+        kernel = np.array(kernel)
+        np.divide(kernel, kernel.sum(), out=kernel)
+        while len(kernel.shape) < len(self.shape):
+            kernel = np.expand_dims(kernel, len(kernel.shape))
+        if apply:
+            convolve(self, kernel, output=self, origin=origin)
+            return self
+        else:
+            return convolve(self, kernel, origin=origin)
+
+    def gaussian_filter(self, sigma, order=0, apply=True):
+        if apply:
+            gaussian_filter(self, sigma, order=order, output=self)
+            return self
+        else:
+            return gaussian_filter(self, sigma, order=order)
+
+    def uniform_filter(self, size, apply=True, origin=0):
+        if apply:
+            uniform_filter(self, size=size, output=self, origin=origin)
+            return self
+        else:
+            return uniform_filter(self, size=size, origin=origin)
+    
+    def median_filter(self, size, footprint=None, apply=True, origin=0):
+        if apply:
+            median_filter(self, size=size, footprint=footprint, output=self, origin=origin)
+            return self
+        else:
+            return median_filter(self, size=size, footprint=footprint, origin=origin)
+
     def __print__(self, str, end='\n'):
         if self.verbose:
             print(str, end=end)
@@ -45,6 +105,14 @@ class ImgBandsGroup(np.ndarray):
 
     def __height2size__(self, l):
         return   int(l/abs(self.geoTransform[5]))
+
+    def __verifyDatasets__(self):
+        if len(self.datasets) == 0:
+            raise ValueError("No datasets found")
+        d0 = self.datasets[0]
+        for ds in self.datasets:
+            if (d0.RasterXSize, d0.RasterYSize) != (ds.RasterXSize, ds.RasterYSize):
+                raise ValueError("datasets have different sizes")
 
     def __calculateShapes__(self):
         rasterShape = np.array((self.datasets[0].RasterYSize, self.datasets[0].RasterXSize))
@@ -87,9 +155,9 @@ class ImgBandsGroup(np.ndarray):
                                     int(block[1]), int(block[0]))
             if len(raw.shape) == 2:
                 self.__refactor__(raw, row, i)
-            elif len(raw.shape) == 3 and raw.shape[0] >= max(self.bands) + 1:
+            elif len(raw.shape) == 3:
                 for j in range(len(self.bands)):
-                    self.__refactor__(raw[self.bands[j],:,:], row, j)
+                    self.__refactor__(raw[int(self.bands[j]),:,:], row, j)
                 return
             else:
                 raise ValueError("Dataset Bands Number Not satisfy bands selection")
@@ -113,15 +181,15 @@ class ImgBandsGroup(np.ndarray):
 class ImgBand(ImgBandsGroup):
 
     @staticmethod
-    def make(dataset, bands, subset, subsetMode, resizeFactor, geodata, verbose=False, cache=None):
+    def make(dataset, band, subset, subsetMode, resizeFactor, geodata, verbose=False, cache=None):
         if cache is None:
             imgBand = ImgBand(0)
-            imgBand.__make__([dataset], bands, subset, subsetMode, resizeFactor, geodata, verbose)
+            imgBand.__make__([dataset], [band], subset, subsetMode, resizeFactor, geodata, verbose)
             imgBand.resize(imgBand.factorShape, refcheck=False)
             imgBand.__load__()
         else:
             imgBand = ImgBand(cache.shape, dtype=cache.dtype, buffer=cache, offset=0)
-            imgBand.__make__([dataset], bands, subset, subsetMode, resizeFactor, geodata, verbose)
+            imgBand.__make__([dataset], [band], subset, subsetMode, resizeFactor, geodata, verbose)
         return imgBand 
 
     def __refactor__(self, raw, row, band):
@@ -130,7 +198,7 @@ class ImgBand(ImgBandsGroup):
 
 class ImgSpectral:
 #********************************* Default Config ************************************
-    validSensors = ['sentinel2', 'landsat8', 'landsat7', 'hyperion']
+    validSensors = ['sentinel2', 'landsat8', 'landsat7', 'hyperion', 'default']
     sensorsConfig = {
         'default' : {
             'bandsExtensions' : ['tif', 'TIF', 'jp2', 'JP2'],
@@ -141,7 +209,7 @@ class ImgSpectral:
             'bandsExtensions' : ['tif', 'TIF'],
             'nameSeparator' : '_',
             'bandsPrefixes' : ['band', 'b', 'B', 'BAND', 'B0', 'BAND0', 'B00', 'BAND00'],
-            'rgbBands' : ['29', '23', '16'],
+            'rgbBands' : ['26', '16', '8'],
             'nirBand' : '52'
         },
         'sentinel2' : {
@@ -179,7 +247,9 @@ class ImgSpectral:
 
 #********************************* Constructor **************************************
 
-    def __init__(self, path, sensor = 'default', resizeFactor = None, cache = None, subset= None, subsetMode='latlon'):
+    def __init__(self, path, sensor = 'default', resizeFactor = None, cache = None, subset= None, subsetMode='latlon', geodata=None):
+        if not os.path.isdir(path):
+            raise ValueError("path is not a forder, folder is required")
         self.sensor = sensor
         self.resizeFactor = resizeFactor if not resizeFactor is None else ImgSpectral.resizeFactor
         self.cache = cache if not (cache is None) else ImgSpectral.cache
@@ -190,12 +260,16 @@ class ImgSpectral:
         if not self.path.exists() :
             raise FileNotFoundError('Data Path Not Exist') 
         self.config = ImgSpectral.sensorsConfig[self.sensor]
-        self.__subset = subset
-        self.__subsetMode = subsetMode
-        self.__selectBandsFiles__()
-        self.pathCahe = self.path/'.imgspectral/cache'/str(self.resizeFactor)
+        self.bandsFiles = []
+        self.multibandDataset = None
         self.__bandsGroups__ = {}
         self.datasets = {}
+        self.__subset = subset
+        self.__subsetMode = subsetMode
+        self.__geodata = geodata
+        self.pathCahe = self.path/'.imgspectral/cache'/str(self.resizeFactor)
+        self.__selectBandsFiles__()
+        
 
 #**********************************  User Methods ***********************************
     def resize(self, resizeFactor):
@@ -205,26 +279,44 @@ class ImgSpectral:
         return ImgSpectral(self.pathString, self.sensor, self.resizeFactor, self.cache, subset, subsetMode)
 
     def bandsGroup(self, bands):
-        if len(bands) < 1:
-            raise ValueError("Not can load zero bands")
+        if len(bands) < 2:
+            raise ValueError("Bands Group require two bands minimum")
         bands = [str(band) for band in bands]
         group = self.__groupName__(bands)
         if not group in self.__bandsGroups__:
-            ds =  self.__openBandsGroup__(bands)
-            if len(bands) == 1:
-                self.__bandsGroups__[group] = self.__loadBand__(group, ds[0])
-            else:
-                self.__bandsGroups__[group] = self.__loadBandsGroup__(group, ds)
+            ds, bs =  self.__openBandsGroup__(bands)
+            self.__bandsGroups__[group] = self.__loadBandsGroup__(group, ds, bs)
         return self.__bandsGroups__[group]
 
     def band(self, band):
-        return self.bandsGroup([band])
+        bands = [str(band)]
+        group = self.__groupName__(bands)
+        if not group in self.__bandsGroups__:
+            ds, bs =  self.__openBandsGroup__(bands)
+            self.__bandsGroups__[group] = self.__loadBand__(group, ds[0], bs[0])
+        return self.__bandsGroups__[group]
+
+    def rgbBands(self, bands=None):
+        if bands is None and not "rgbBands" in self.config:
+            raise ValueError("{} sensor not have predefined rgb bands, you must specify it: bands=[r,g,b]".format(self.sensor))
+        bands = self.config["rgbBands"] if bands is None else bands
+        return self.bandsGroup(bands)
 
     def rgb(self, bands = None):
-        bands = self.config["rgbBands"] if bands is None else bands
-        return ImgSpectral.color(self.bandsGroup(bands))
+        return ImgSpectral.color(self.rgbBands(bands))
+
+    def cirBands(self, bands=None):
+        if bands is None and (not "rgbBands" in self.config or not "nirBand" in self.config):
+            raise ValueError("{} sensor not have predefined bands, you must specify it: bands=[nir, r, g]".format(self.sensor))
+        bands = [self.config["nirBand"]] + self.config["rgbBands"][0:2] if bands is None else bands
+        return self.bandsGroup(bands)
+
+    def infrared(self, bands = None):
+        return ImgSpectral.color(self.cirBands(bands))
 
     def ndvi(self, bands = None):
+        if bands is None and (not "rgbBands" in self.config or not "nirBand" in self.config):
+            raise ValueError("{} sensor not have predefined bands, you must specify it: bands=[nir, red]".format(self.sensor))
         bands = [self.config["nirBand"], self.config["rgbBands"][0]] if bands is None else bands
         nir, red = self.band(bands[0]), self.band(bands[1])
         ndvi = np.ndarray(nir.shape)
@@ -234,6 +326,27 @@ class ImgSpectral:
         ndvi[np.isnan(ndvi)] = 0
         return ndvi
     
+    def msr(self, bands = None):
+        if bands is None and (not "rgbBands" in self.config or not "nirBand" in self.config):
+            raise ValueError("{} sensor not have predefined bands, you must specify it: bands=[nir, red]".format(self.sensor))
+        bands = [self.config["nirBand"], self.config["rgbBands"][0]] if bands is None else bands
+        nir, red = self.band(bands[0]), self.band(bands[1])
+        msr = np.ndarray(nir.shape)
+        np.divide(nir, red, out=msr)
+        np.add(msr, 1, out = nir)
+        np.subtract(msr, 1, out=msr)
+        np.sqrt(nir, out=nir)
+        np.divide(msr, nir, out=msr)
+        msr[np.isnan(msr)] = 0
+        return msr
+
+    def tvi(self, bands = None):
+        tvi = self.ndvi(bands)
+        np.add(tvi, 1, out=tvi)
+        np.divide(tvi, 2, out=tvi)
+        np.sqrt(tvi, out=tvi)
+        return tvi
+
     # def pixelLatLon(self, x, y):
     #     gt = self.geoTransform
     #     _x, _y = gt[0] + x*gt[1] + y*gt[2], gt[3] + x*gt[4] + y*gt[5]
@@ -277,26 +390,26 @@ class ImgSpectral:
         subset_name = "None" if self.__subset is None else '_'.join([str(i) for i in self.__subset])
         return bands_name + "x" + subset_name + "x" + self.__subsetMode
 
-    def __loadBand__(self, cachePathFile, dataset):
+    def __loadBand__(self, cachePathFile, dataset, band):
         band = None
         if self.cache :
-            band = self.__loadBandFromCache__(cachePathFile, dataset)
+            band = self.__loadBandFromCache__(cachePathFile, dataset, band)
         if band is None:
             self.__print__('Loading %s %s image from Dataset...' % (self.path.name, cachePathFile))
-            geodata = ImgSpectral.geodata(dataset)
-            band = ImgBand.make(dataset, [0], self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, None)
+            geodata = ImgSpectral.geodata(dataset) if self.__geodata is None else self.__geodata
+            band = ImgBand.make(dataset, band, self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, None)
             if self.cache :
                 self.__saveCache__(cachePathFile, band)
         return band
 
-    def __loadBandsGroup__(self, cachePathFile, datasetGroup):
+    def __loadBandsGroup__(self, cachePathFile, datasets, bands):
         bandsGroup = None
         if self.cache :
-            bandsGroup = self.__loadGroupFromCache__(cachePathFile, datasetGroup)
+            bandsGroup = self.__loadGroupFromCache__(cachePathFile, datasets, bands)
         if bandsGroup is None:
             self.__print__('Loading %s %s image from Dataset...' % (self.path.name, cachePathFile))
-            geodata = ImgSpectral.geodata(datasetGroup[0])
-            bandsGroup = ImgBandsGroup.make(datasetGroup, range(len(datasetGroup)), self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, None)
+            geodata = ImgSpectral.geodata(datasets[0]) if self.__geodata is None else self.__geodata
+            bandsGroup = ImgBandsGroup.make(datasets, bands, self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, None)
             if self.cache :
                 self.__saveCache__(cachePathFile, bandsGroup)
         return bandsGroup
@@ -308,6 +421,8 @@ class ImgSpectral:
     @staticmethod
     def __normalice__(_img):
         _nan = max(-100, np.min(_img))
+        if np.sum(_img > _nan) == 0:
+            return _img
         _min = np.min(_img[_img > _nan])
         _max = np.max(_img)
         np.subtract(_img, _min, out=_img)
@@ -317,22 +432,37 @@ class ImgSpectral:
         return _img
 
     def __openBandsGroup__(self, bands):
-        datasets = []
-        for band in bands:
-            if not band in self.datasets:
-                bandPath = self.__findBandPathFile__(band)
-                if bandPath is None:
-                    raise ValueError('Error: %s band %s not Found...' % (self.path.name, band)) 
-                self.datasets[band] = gd.Open(str(self.path/bandPath))
-            datasets.append(self.datasets[band]) 
-        return datasets
+        if self.multibandDataset is None:
+            datasets = []
+            for band in bands:
+                if not band in self.datasets:
+                    bandPath = self.__findBandPathFile__(band)
+                    if bandPath is None:
+                        raise ValueError('Error: %s band %s not Found...' % (self.path.name, band)) 
+                    self.datasets[band] = gd.Open(str(self.path/bandPath))
+                datasets.append(self.datasets[band]) 
+            return datasets, list(range(len(bands)))
+        else:
+            return ([self.multibandDataset], bands)
 
     def __selectBandsFiles__(self):
-        self.bandsFiles = []
         for ext in self.config['bandsExtensions']:
             paths = list(self.path.glob('**/*.' + ext))
             for path in paths:
-                self.bandsFiles.append(path.name.split('.'))    
+                self.bandsFiles.append(path.name.rsplit('.',1))
+        if len(self.bandsFiles) == 0:
+            self.__print__("Not Bands files found, trying find multiband file")
+            paths = list(self.path.glob('**/*'))
+            for path in paths:
+                try:
+                    ds = gd.Open(str(path))
+                    ta = ds.ReadAsArray(0,0,1,1)
+                    if len(ta.shape) == 3:
+                        self.multibandDataset = ds
+                        return
+                except:
+                    pass
+            raise ValueError("Not Found bands files")
         
     def __findBandPathFile__(self, bandName):
         for name, ext in self.bandsFiles:
@@ -342,22 +472,22 @@ class ImgSpectral:
                         return name + '.' + ext
         return None
 
-    def __loadBandFromCache__(self, filePath, dataset) :
+    def __loadBandFromCache__(self, filePath, dataset, band) :
         if not (self.pathCahe/(filePath + '.npy')).exists() :
             return None
         self.__print__('Loading %s %s data from Cache' % (self.path.name, filePath))
         cache = np.load(self.pathCahe/(filePath + '.npy'))
-        geodata = ImgSpectral.geodata(dataset)
-        band = ImgBand.make(dataset, [0], self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, cache)
-        return band
+        geodata = ImgSpectral.geodata(dataset) if self.__geodata is None else self.__geodata
+        imgband = ImgBand.make(dataset, band, self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, cache)
+        return imgband
 
-    def __loadGroupFromCache__(self, filePath, datasets) :
+    def __loadGroupFromCache__(self, filePath, datasets, bands) :
         if not (self.pathCahe/(filePath + '.npy')).exists() :
             return None
         self.__print__('Loading %s %s data from Cache' % (self.path.name, filePath))
         cache = np.load(self.pathCahe/(filePath + '.npy'))
-        geodata = ImgSpectral.geodata(datasets[0])
-        bandsGroup = ImgBandsGroup.make(datasets, range(len(datasets)), self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, cache)
+        geodata = ImgSpectral.geodata(datasets[0]) if self.__geodata is None else self.__geodata
+        bandsGroup = ImgBandsGroup.make(datasets, bands, self.__subset, self.__subsetMode, self.resizeFactor, geodata, self.verbose, cache)
         return bandsGroup
         
     def __saveCache__(self, filePath, data) :
